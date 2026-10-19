@@ -12,7 +12,7 @@
  *                control flow is preserved across the process boundary.
  *
  *                SHARED MEMORY (beyond Cygwin): every mapping created
- *                through px_shm_attach()/px_mmap_shared() below lives in an
+ *                through px_shm_attach()/px_shm_open() below lives in an
  *                NT section (CreateFileMappingA with INVALID_HANDLE_VALUE),
  *                is exported to fork children as a NAMED global mapping
  *                ("pxshm_<ppid>_<seq>") plus its fixed preferred address,
@@ -28,7 +28,7 @@
  *                shared-memory extension still maps at arbitrary addresses
  *                with no fork-tree propagation.  What we deliberately do
  *                NOT clone is private CRT heap/stack/global data -- see
- *                px_shm.h for the semantics table and limitations.
+ *                <sys/shm.h> for the semantics table and limitations.
  *
  *                A subtlety: the child must NOT block before its first call
  *                into this compat layer, because then the parent would
@@ -181,15 +181,18 @@ static void px_proc_forget_all(void)
 /* (post-fork writes never cross) and whose cygserver shm keeps no      */
 /* fixed-address fork-tree propagation.                                 */
 /*                                                                     */
-/* name format: "pxshm_<originpid>_<seq>" -- unique across the tree     */
-/* because originpid identifies the process where the mapping was born. */
-/* Values stay digits + '_' so cmd.exe cannot mangle them.               */
-/* ------------------------------------------------------------------ */
+/* name format: auto-created regions get "pxshm_<originpid>_<seq>" --
+ * unique across the tree because originpid identifies the process where
+ * the mapping was born.  Named regions (px_shm_open) keep their own key
+ * in slot.key and are re-attachable by that key; their NT object name is
+ * "pxshm_k<fnv(key)>".  Values stay digits + '_' so cmd.exe cannot
+ * mangle them.                                                      */
 #define PX_MAX_SHMS 64
 
 typedef struct {
     int     used;
-    char    name[64];          /* named global file-mapping object */
+    char    name[64];          /* NT global file-mapping object name */
+    char    key[64];           /* user-visible key ("" = auto region) */
     void   *addr;              /* fixed preferred base address */
     size_t  size;
     HANDLE  hmap;              /* our section handle */
@@ -216,7 +219,9 @@ static void px_shm_unlock(void)
     LeaveCriticalSection(&px_shm_cs);
 }
 
-/* build the PX_SHM_TABLE string ("name.size.addr;..").  Caller frees. */
+/* build the PX_SHM_TABLE string ("name.key.size.addr;..\").  The table
+ * is exported through fork(); key may be empty (auto region).  Values
+ * use only [A-Za-z0-9_.] so they survive env round-trips. */
 static char *px_shmtable_encode(void)
 {
     static char buf[8192];
@@ -225,11 +230,11 @@ static char *px_shmtable_encode(void)
     buf[0] = '\0';
     px_shm_lock();
     for (i = 0; i < PX_MAX_SHMS; i++) {
-        char tmp[160];
+        char tmp[256];
         int m;
         if (!px_shms[i].used) continue;
-        m = snprintf(tmp, sizeof(tmp), "%s%s.%u.%llu",
-                     n ? ";" : "", px_shms[i].name,
+        m = snprintf(tmp, sizeof(tmp), "%s%s.%s.%u.%llu",
+                     n ? ";" : "", px_shms[i].name, px_shms[i].key,
                      (unsigned)px_shms[i].size,
                      (unsigned long long)(uintptr_t)px_shms[i].addr);
         if (m <= 0 || used + (size_t)m >= sizeof(buf) - 1) break;
@@ -253,18 +258,29 @@ static void px_shmtable_import(void)
     snprintf(copy, sizeof(copy), "%s", env);
     for (p = strtok_s(copy, ";", &save); p; p = strtok_s(NULL, ";", &save)) {
         char name[64] = "";
+        char key[64]  = "";
         unsigned long long sz = 0, ad = 0;
         HANDLE h;
         void *got;
-        int slot, i;
-        char *c1 = strchr(p, '.'), *c2;
-        if (!c1) continue;
-        c2 = strchr(c1 + 1, '.');
-        if (!c2) continue;
-        if (c1 - p >= (int)sizeof(name)) continue;
-        memcpy(name, p, (size_t)(c1 - p)); name[c1 - p] = '\0';
-        sz = strtoull(c1 + 1, NULL, 10);
-        ad = strtoull(c2 + 1, NULL, 10);
+        int slot, i, nflds;
+        char *f[4], *q, *lim;
+        /* split into up to 4 '.'-separated fields */
+        nflds = 0;
+        q = p; lim = p + strlen(p);
+        while (q <= lim && nflds < 4) {
+            char *dot = strchr(q, '.');
+            f[nflds++] = q;
+            if (!dot) { q = lim + 1; break; }
+            *dot = '\0';
+            q = dot + 1;
+        }
+        if (nflds != 4) continue;
+        if (strlen(f[0]) >= sizeof(name)) continue;
+        if (strlen(f[1]) >= sizeof(key))  continue;
+        snprintf(name, sizeof(name), "%s", f[0]);
+        snprintf(key,  sizeof(key),  "%s", f[1]);
+        sz = strtoull(f[2], NULL, 10);
+        ad = strtoull(f[3], NULL, 10);
         if (!sz || !ad) continue;
 
         /* reserve our slot FIRST, then open+map: on failure we unmap,
@@ -282,6 +298,8 @@ static void px_shmtable_import(void)
             px_shms[slot].used = 1;
             snprintf(px_shms[slot].name, sizeof(px_shms[slot].name),
                      "%s", name);
+            snprintf(px_shms[slot].key, sizeof(px_shms[slot].key),
+                     "%s", key);
             px_shms[slot].size  = (size_t)sz;
             px_shms[slot].addr  = (void *)(uintptr_t)ad;
             px_shms[slot].hmap  = NULL;
@@ -324,14 +342,26 @@ static void px_shmtable_forget_all(void)
     _putenv_s(PX_SHMTABLE_ENV, "");
 }
 
+/* FNV-1a 64 over a NUL-terminated string */
+static unsigned long long px_fnv64(const char *s)
+{
+    unsigned long long hv = 1469598103934665603ULL;
+    const unsigned char *b = (const unsigned char *)s;
+    for (; *b; b++) { hv ^= *b; hv *= 1099511628211ULL; }
+    return hv;
+}
+
 /* Create/attach a shared mapping of `size` bytes at a deterministic,
- * collision-resistant fixed address.  If `seed_name` is non-NULL the
- * address is derived from it so two independent px_fork() trees (or a
- * program and its exec'd children using PX_SHM_SEED) land on the same
- * pointer; otherwise our own seed (published to children through the
- * PX_SHM_SEED env var, like System V's SHMMIN window) is used.
+ * collision-resistant fixed address.  If `key` is non-NULL this is a
+ * NAMED region: the first call with that key creates it, later calls
+ * (same process or any fork descendant that inherited it) re-attach at
+ * the identical pointer; the NT object name and the preferred VA are
+ * both derived from the key hash so they are stable across the tree.
+ * With key==NULL an anonymous region is created instead; its address
+ * comes from our per-tree seed (PX_SHM_SEED env var, published to all
+ * fork children), like System V's SHMMIN window.
  * Returns the shared pointer or NULL (errno set).  Thread-safe. */
-static void *px_shm_attach(size_t size, const char *seed_name)
+static void *px_shm_attach(size_t size, const char *key)
 {
     char name[64];
     char seedbuf[32];
@@ -341,36 +371,21 @@ static void *px_shm_attach(size_t size, const char *seed_name)
     HANDLE h = NULL;
     void *addr = NULL, *got;
     long seq;
+    unsigned long long hv;
 
     if (size == 0) { errno = EINVAL; return NULL; }
     size = (size + 0xffff) & ~(size_t)0xffff;   /* round to 64 KiB align */
 
-    px_shm_lock();
-    for (i = 0; i < PX_MAX_SHMS; i++) {
-        if (px_shms[i].used && seed_name &&
-            strcmp(px_shms[i].name, seed_name) == 0) {
-            void *a = px_shms[i].addr;          /* already attached here */
-            px_shm_unlock();
-            return a;
-        }
-    }
-    for (i = 0; i < PX_MAX_SHMS; i++)
-        if (!px_shms[i].used) { slot = i; break; }
-    px_shm_unlock();
-    if (slot < 0) { errno = ENOSPC; return NULL; }
-
-    seq = InterlockedIncrement(&px_shm_seq);
-    snprintf(name, sizeof(name), "pxshm_%lu_%ld",
-             (unsigned long)GetCurrentProcessId(), seq);
-
-    /* deterministic preferred base: hash(seed) into the 0x5F12_0000 ..
-       0x5FFF_FFFF user hole, page aligned, spread by seq.  With ASLR this
-       VA is free in practice; MEM_RESERVE first makes any clash explicit
-       instead of silently relocating (relocation would break the
-       identical-pointer guarantee). */
-    if (seed_name && *seed_name) {
-        seed = seed_name;
+    /* ---- derive NT object name + address seed ---- */
+    if (key && *key) {
+        hv = px_fnv64(key);
+        snprintf(name, sizeof(name), "pxshm_k%llu", hv);
+        seed = name;                    /* VA follows the key: stable */
     } else {
+        key = NULL;                     /* normalise "" -> anonymous */
+        seq = InterlockedIncrement(&px_shm_seq);
+        snprintf(name, sizeof(name), "pxshm_%lu_%ld",
+                 (unsigned long)GetCurrentProcessId(), seq);
         seed = getenv("PX_SHM_SEED");
         if (!seed || !*seed) {
             unsigned long long s = GetTickCount64() ^
@@ -382,12 +397,33 @@ static void *px_shm_attach(size_t size, const char *seed_name)
               _putenv(x); }   /* publish: fork children share our window */
         }
     }
+
+    /* ---- look up / reserve a table slot ---- */
+    px_shm_lock();
+    for (i = 0; i < PX_MAX_SHMS; i++) {
+        if (px_shms[i].used && strcmp(px_shms[i].name, name) == 0) {
+            void *a = px_shms[i].addr;          /* already attached here */
+            px_shm_unlock();
+            return a;
+        }
+    }
+    for (i = 0; i < PX_MAX_SHMS; i++)
+        if (!px_shms[i].used) { slot = i; break; }
+    px_shm_unlock();
+    if (slot < 0) { errno = ENOSPC; return NULL; }
+
+    /* deterministic preferred base: hash(seed) into the 0x5F12_0000 ..
+       0x5FFF_FFFF user hole, 64 KiB aligned.  For named regions the hash
+       depends only on the key, so every attacher computes the same VA;
+       for anonymous ones it also mixes in seq.  With ASLR this VA is free
+       in practice; MEM_RESERVE first makes any clash explicit instead of
+       silently relocating (relocation would break the identical-pointer
+       guarantee). */
+    if (key) hv = px_fnv64(seed);
+    else     hv = px_fnv64(seed) ^
+                     ((unsigned long long)seq * 0x9E3779B97F4A7C15ULL);
     {
-        unsigned long long hv = 1469598103934665603ULL; /* FNV-1a 64 */
-        const unsigned char *s = (const unsigned char *)seed;
-        for (; *s; s++) { hv ^= *s; hv *= 1099511628211ULL; }
-        hv ^= (unsigned long long)seq * 0x9E3779B97F4A7C15ULL;
-        base = 0x5F120000ULL + (hv % 0x00ED0000ULL) & ~0xffffULL;
+        base = (0x5F120000ULL + (hv % 0x00ED0000ULL)) & ~0xffffULL;
         if (base + size > 0x60000000ULL)
             base = 0x5F120000ULL +
                    ((base + 0x20000 - 0x60000000ULL) & 0x00ED0000ULL);
@@ -401,15 +437,17 @@ static void *px_shm_attach(size_t size, const char *seed_name)
         return NULL;
     }
 
+    /* create-or-open the section (named regions: first creator wins,
+       later callers attach the very same physical pages) */
     h = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
                            (DWORD)((unsigned long long)size >> 32),
                            (DWORD)(size & 0xffffffffUL), name);
-    if (!h) { UnmapViewOfFile(addr); errno = px_set_errno_from_win(), ENOMEM; }
+    if (!h) { UnmapViewOfFile(addr); px_set_errno_from_win(); errno = ENOMEM; }
     if (h) {
         got = MapViewOfFileEx(h, FILE_MAP_WRITE, 0, 0, size, addr);
         if (!got) { CloseHandle(h); UnmapViewOfFile(addr); errno = ENOMEM; }
         else {
-            /* register (double-check the seed-name race) */
+            /* register (double-check the name race) */
             int dup = 0;
             px_shm_lock();
             for (i = 0; i < PX_MAX_SHMS; i++)
@@ -419,10 +457,12 @@ static void *px_shm_attach(size_t size, const char *seed_name)
                 px_shms[slot].used   = 1;
                 snprintf(px_shms[slot].name, sizeof(px_shms[slot].name),
                          "%s", name);
+                snprintf(px_shms[slot].key, sizeof(px_shms[slot].key),
+                         "%s", key ? key : "");
                 px_shms[slot].addr   = addr;
                 px_shms[slot].size   = size;
                 px_shms[slot].hmap   = h;
-                px_shms[slot].owner  = (seed_name == NULL);
+                px_shms[slot].owner  = (key == NULL);
             }
             px_shm_unlock();
             if (dup) {
@@ -433,7 +473,6 @@ static void *px_shm_attach(size_t size, const char *seed_name)
             return addr;
         }
     }
-    (void)hCheck;
     return NULL;
 }
 
@@ -786,13 +825,15 @@ static void px_fork_arm_if_child(void)
 }
 
 /* performed at most once, lazily, right before the child's first real
- * compat-layer operation: import inherited fds, then block until the
+ * compat-layer operation: import inherited fds, re-materialise the
+ * parent's shared mappings at identical addresses, then block until the
  * parent's fork() has returned. */
 static void px_fork_child_handshake(void)
 {
     HANDLE r;
     if (InterlockedCompareExchange(&px_fork_state, 2, 1) != 1) return;
     px_fdtable_import();              /* pick up inherited pipe/socket fds */
+    px_shmtable_import();             /* same shm pointers as the parent */
     r = OpenEventA(EVENT_SYNCHRONIZE, FALSE, px_fork_ev_ready);
     if (r) { WaitForSingleObject(r, INFINITE); CloseHandle(r); }
 }
@@ -812,8 +853,8 @@ static pid_t px_fork(void)
     HANDLE ev_ready = NULL, ev_ack = NULL;
     PROCESS_INFORMATION pi;
     char *cmdline = NULL;
-    char xchild[352], xppid[64];
-    char *extra[3];
+    char xchild[352], xppid[64], xshm[sizeof(PX_SHMTABLE_ENV) + 8192];
+    char *extra[4];
     WCHAR self[MAX_PATH * 2];
     int rc, i;
 
@@ -890,7 +931,10 @@ static pid_t px_fork(void)
              PX_FORK_CHILD_ENV, names[0], names[1]);
     snprintf(xppid,  sizeof(xppid),  "%s=%d",
              PX_FORK_PPID_ENV, (int)_getpid());
-    extra[0] = xchild; extra[1] = xppid; extra[2] = NULL;
+    /* snapshot the shared mappings NOW: the child re-maps them at the
+       identical virtual addresses inside its fork handshake */
+    snprintf(xshm, sizeof(xshm), "%s=%s", PX_SHMTABLE_ENV, px_shmtable_encode());
+    extra[0] = xchild; extra[1] = xppid; extra[2] = xshm; extra[3] = NULL;
 
     rc = px_spawn(NULL, cmdline, extra, 0, &pi);
     free(cmdline);
@@ -1033,6 +1077,7 @@ static int px_exec_common(const char *path, char *const argv[],
     for (i = 3; i < 256; i++)
         if (_get_osfhandle(i) != -1 && px_fdinfo_cloexec(i)) _close(i);
     px_proc_forget_all();
+    px_shmtable_forget_all(); /* POSIX: shared anon mappings do not survive exec */
     WaitForSingleObject(pi.hProcess, INFINITE);
     {
         DWORD code = 1;

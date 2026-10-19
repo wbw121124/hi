@@ -58,7 +58,7 @@ extern "C" {
 /* ---- file descriptor I/O ----------------------------------------- */
 static ssize_t read(int fd, void *buf, size_t n)
 {
-    px_fork_arm_if_child(); /* (no-op once resolved) */
+    px_fork_lazy_handshake(); /* arm + finish fork handshake once */
     ssize_t r = px_fd_read(fd, buf, n); /* dispatches files vs sockets */
     if (r == -1) px_set_errno_from_win();
     return r;
@@ -66,7 +66,7 @@ static ssize_t read(int fd, void *buf, size_t n)
 
 static ssize_t write(int fd, const void *buf, size_t n)
 {
-    px_fork_arm_if_child();
+    px_fork_lazy_handshake();
     ssize_t r = px_fd_write(fd, buf, n);
     if (r == -1) px_set_errno_from_win();
     return r;
@@ -417,12 +417,53 @@ static int pipe2(int fds[2], int flags) { return px_pipe(fds, flags); }
 /* ---- fork() / exec*() ----------------------------------------------
  * Windows has no native fork(); compat/winproc.h emulates it by
  * spawning a fresh copy of the current executable with a handshake so
- * `pid = fork(); if (pid == 0) ...` behaves like POSIX.  See the header
- * comment in winproc.h for semantics and limitations (no shared memory;
- * pre-branch side effects run twice).  exec*() replaces this process
- * image by running the new program and exiting with its status.
+ * `pid = fork(); if (pid == 0) ...` behaves like POSIX.  Shared memory
+ * crosses the boundary: mappings created through mmap(MAP_SHARED) or
+ * <sys/shm.h>'s px_shm_open() are re-materialised in the child at the
+ * IDENTICAL virtual address backed by the same physical pages (fork-tree address-space
+ * overlay -- see winproc.h; this exceeds what Cygwin's private-clone
+ * fork can do).  Pre-branch side effects still run twice.  exec*()
+ * replaces this process image by running the new program and exiting
+ * with its status; shared mappings are dropped across exec, per POSIX.
  */
 static pid_t fork(void) { return px_fork(); }
+
+/* MAP_SHARED anonymous mapping that survives fork() with identical
+ * pointers in parent and children (POSIX mmap(MAP_SHARED|MAP_ANONYMOUS)
+ * subset).  addr is ignored (fixed placement is part of the contract);
+ * prot must be readable/writable. */
+#ifndef MAP_SHARED
+#define MAP_SHARED 0x01
+#endif
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20
+#endif
+#ifndef PROT_READ
+#define PROT_READ  0x1
+#define PROT_WRITE 0x2
+#endif
+#ifndef MAP_FAILED
+#define MAP_FAILED ((void *)-1)
+#endif
+
+static void *mmap(void *addr, size_t length, int prot, int flags,
+                  int fd, off_t offset)
+{
+    (void)addr; (void)prot;
+    if (!(flags & MAP_SHARED)) { errno = EINVAL; return MAP_FAILED; }
+    if ((flags & MAP_ANONYMOUS) || fd < 0) {
+        void *p = px_shm_attach(length, NULL);
+        return p ? p : MAP_FAILED;
+    }
+    errno = ENOTSUP;                /* file-backed maps: not emulated */
+    return MAP_FAILED;
+}
+
+static int munmap(void *addr, size_t length)
+{
+    (void)length;
+    return px_shm_detach(addr);
+}
 
 static int execl(const char *path, const char *arg0, ...);
 static int execle(const char *path, const char *arg0, ...);
