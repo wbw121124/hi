@@ -7,6 +7,7 @@
  *   - pipe()/pipe2() emulated with a loopback socket pair
  *   - reparse-point (symlink) target reader used by readlink()
  *   - alarm() implemented with CreateTimerQueueTimer + RaiseException
+ *   - fork()/exec*() process emulation (compat/winproc.h)
  *
  * Not part of the public API; included by <unistd.h>, <fcntl.h>, <poll.h>.
  * License: MIT
@@ -23,6 +24,45 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ------------------------------------------------------------------ */
+/* fd cloexec bookkeeping (shared with compat/winproc.h)               */
+/*                                                                     */
+/* Windows env-var names are case-insensitive/upper-cased, so the       */
+/* fork()/exec*() fd table in winproc.h avoids letters in its values.   */
+/* The O_CLOEXEC bit value is defined here as well; <fcntl.h>           */
+/* re-defines it identically.                                           */
+/* ------------------------------------------------------------------ */
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0x200000
+#endif
+
+typedef struct { int fd; int cloexec; } px_fdinfo_t;
+static px_fdinfo_t px_fdinfo[256];
+static int px_fdinfo_n = 0;
+
+/* record close-on-exec state per fd so fork()/exec*() (winproc.h) can
+ * decide which handles to hand to the child.  Also readable there via
+ * the same statics (single translation unit when headers are included
+ * from one .c file). */
+static void px_fdinfo_set(int fd, int cloexec)
+{
+    int i;
+    for (i = 0; i < px_fdinfo_n; i++)
+        if (px_fdinfo[i].fd == fd) { px_fdinfo[i].cloexec = cloexec; return; }
+    if (fd >= 0 && fd < 256 && px_fdinfo_n < 256) {
+        px_fdinfo[px_fdinfo_n].fd = fd;
+        px_fdinfo[px_fdinfo_n].cloexec = cloexec;
+        px_fdinfo_n++;
+    }
+}
+static int px_fdinfo_cloexec(int fd)
+{
+    int i;
+    for (i = 0; i < px_fdinfo_n; i++)
+        if (px_fdinfo[i].fd == fd) return px_fdinfo[i].cloexec;
+    return 0; /* unknown: assume inheritable, like a fresh open() */
+}
 
 /* ------------------------------------------------------------------ */
 /* winsock lazy init                                                   */
@@ -144,6 +184,9 @@ static int px_pipe(int fds[2], int flags)
         if (fds[1] != -1) _close(fds[1]);
         return -1;
     }
+    /* record cloexec state so fork()/exec*() export the right ends */
+    px_fdinfo_set(fds[0], (flags & O_CLOEXEC) ? 1 : 0);
+    px_fdinfo_set(fds[1], (flags & O_CLOEXEC) ? 1 : 0);
     return 0;
 }
 

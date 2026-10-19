@@ -15,6 +15,7 @@
 #include <string.h>
 #include "compat/posix_defs.h"
 #include "compat/winfd.h"
+#include "compat/winproc.h"   /* fork()/exec*() emulation */
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +58,7 @@ extern "C" {
 /* ---- file descriptor I/O ----------------------------------------- */
 static ssize_t read(int fd, void *buf, size_t n)
 {
+    px_fork_arm_if_child(); /* (no-op once resolved) */
     ssize_t r = px_fd_read(fd, buf, n); /* dispatches files vs sockets */
     if (r == -1) px_set_errno_from_win();
     return r;
@@ -64,6 +66,7 @@ static ssize_t read(int fd, void *buf, size_t n)
 
 static ssize_t write(int fd, const void *buf, size_t n)
 {
+    px_fork_arm_if_child();
     ssize_t r = px_fd_write(fd, buf, n);
     if (r == -1) px_set_errno_from_win();
     return r;
@@ -310,7 +313,11 @@ static ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
 static pid_t getpid(void)  { return (pid_t)_getpid(); }
 static pid_t getppid(void)
 {
-    /* No parent-PID API on Win32 without undocumented Nt* calls. */
+    /* Win32 has no parent-PID API; our fork() emulation records it in the
+       child's environment before exec'ing.  Fall back to ENOSYS for
+       processes that were not created through px_fork(). */
+    const char *v = getenv("PX_FORK_PPID");
+    if (v && *v) return (pid_t)atoi(v);
     errno = ENOSYS;
     return -1;
 }
@@ -406,6 +413,26 @@ static unsigned int alarm(unsigned int seconds) { return px_alarm(seconds); }
 /* pipe()/pipe2(): loopback socketpair emulation (winfd.h) */
 static int pipe(int fds[2])           { return px_pipe(fds, 0); }
 static int pipe2(int fds[2], int flags) { return px_pipe(fds, flags); }
+
+/* ---- fork() / exec*() ----------------------------------------------
+ * Windows has no native fork(); compat/winproc.h emulates it by
+ * spawning a fresh copy of the current executable with a handshake so
+ * `pid = fork(); if (pid == 0) ...` behaves like POSIX.  See the header
+ * comment in winproc.h for semantics and limitations (no shared memory;
+ * pre-branch side effects run twice).  exec*() replaces this process
+ * image by running the new program and exiting with its status.
+ */
+static pid_t fork(void) { return px_fork(); }
+
+static int execl(const char *path, const char *arg0, ...);
+static int execle(const char *path, const char *arg0, ...);
+static int execlp(const char *file, const char *arg0, ...);
+static int execv(const char *path, char *const argv[])
+{ return px_exec_common(path, argv, NULL, 0); }
+static int execve(const char *path, char *const argv[], char *const envp[])
+{ return px_exec_common(path, argv, envp, 0); }
+static int execvp(const char *file, char *const argv[])
+{ return px_exec_common(file, argv, NULL, 1); }
 
 #ifdef __cplusplus
 }
