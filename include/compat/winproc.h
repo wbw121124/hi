@@ -58,6 +58,7 @@
 
 #include "compat/posix_defs.h"
 #include "compat/winfd.h"
+#include "compat/winpath.h"   /* unix-path <-> win32-path translation */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -973,13 +974,17 @@ static pid_t px_fork(void)
 /* ------------------------------------------------------------------ */
 /* exec family                                                         */
 /* ------------------------------------------------------------------ */
-/* Build a UTF-8 command line from program path + argv[1..]. */
+/* Build a UTF-8 command line from program path + argv[1..].
+ * When unix-path translation is active, every argument is re-translated
+ * back to unix form (px_path_untranslate) so POSIX child processes see
+ * POSIX-looking argv ("/c/users/bob", not "C:\users\bob"). */
 static char *px_build_exec_cmdline(const char *prog, char *const argv[])
 {
     size_t total = strlen(prog) + 8;
     size_t left;
     char *cmdline, *p;
     int i;
+    int unx = !px_path_native_mode();
     for (i = 1; argv[i]; i++) total += strlen(argv[i]) * 4 + 4;
     cmdline = (char *)malloc(total + 1);
     if (!cmdline) return NULL;
@@ -989,8 +994,14 @@ static char *px_build_exec_cmdline(const char *prog, char *const argv[])
     *p++ = '"';
     left = total - (size_t)(p - cmdline) - 1;
     for (i = 1; argv[i]; i++) {
+        char ux[4200];
         *p++ = ' '; left--;
-        p = px_append_arg(p, &left, argv[i]);
+        if (unx) {
+            px_path_untranslate(argv[i], -1, ux, sizeof(ux));
+            p = px_append_arg(p, &left, ux);
+        } else {
+            p = px_append_arg(p, &left, argv[i]);
+        }
     }
     *p = '\0';
     return cmdline;
@@ -1031,8 +1042,17 @@ static int px_exec_common(const char *path, char *const argv[],
 
     if (!path || !argv) { errno = EFAULT; return -1; }
 
-    /* ---- resolve program path ---- */
+    /* ---- resolve program path ----
+       unix-form absolute paths ("/c/win/notepad.exe", "/etc/x") are first
+       mapped to native form through compat/winpath.h; bare names are then
+       looked up on PATH as usual. */
     full[0] = '\0';
+    {
+        char wprog[4200];
+        int trw = px_path_translate(path, wprog, sizeof(wprog));
+        if (trw < 0) { errno = ENAMETOOLONG; return -1; }
+        if (trw > 0) path = wprog;
+    }
     if (search_path && !strchr(path, '/') && !strchr(path, '\\')) {
         DWORD n = SearchPathA(NULL, path, ".exe", sizeof(full), full);
         if (n == 0 || n >= sizeof(full)) {

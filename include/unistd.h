@@ -15,6 +15,7 @@
 #include <string.h>
 #include "compat/posix_defs.h"
 #include "compat/winfd.h"
+#include "compat/winpath.h"  /* unix-path <-> win32-path translation */
 #include "compat/winproc.h"   /* fork()/exec*() emulation */
 
 #ifdef __cplusplus
@@ -150,6 +151,10 @@ static int ftruncate(int fd, off_t length)
 /* ---- open / create ------------------------------------------------
  * open() is a macro so the optional variadic `mode` argument works.
  * O_* flag values are identical to the CRT's in <fcntl.h>.
+ * Absolute unix paths ("/...", "/c/...", "/cygdrive/c/...") are resolved
+ * through compat/winpath.h; POSIX device files (/dev/null, /dev/zero,
+ * /dev/random, /dev/fd/N, ...) and virtual system files (/proc/...,
+ * /etc/passwd, ...) are served by px_dev_open().
  */
 static int px_open_impl(const char *path, int oflag, int pmode)
 {
@@ -157,8 +162,14 @@ static int px_open_impl(const char *path, int oflag, int pmode)
     /* POSIX mode_t permission bits have no direct Win32 equivalent;
        they map to FILE_ATTRIBUTE_READONLY semantics handled by chmod(). */
     (void)pmode;
-    fd = _open(path, oflag | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
-    if (fd == -1) px_set_errno_from_win();
+    if (!px_path_native_mode() && path && path[0] == '/' &&
+        px_dev_is_special(path))
+        return px_dev_open(path, oflag);
+    fd = PX_PATH_RUN(path, ({
+        int _r = _open(p, oflag | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
+        if (_r == -1) px_set_errno_from_win();
+        _r;
+    }));
     return fd;
 }
 /* open() takes an optional third (mode) argument -> variadic macro.
@@ -170,43 +181,65 @@ static int creat(const char *path, mode_t mode)
     return px_open_impl(path, _O_CREAT | _O_TRUNC | _O_WRONLY, (int)mode);
 }
 
-/* ---- file system --------------------------------------------------- */
+/* ---- file system ---------------------------------------------------
+ * Every absolute path below goes through compat/winpath.h: "/..." is
+ * resolved against the virtual POSIX root (PX_UNIX_ROOT or an auto-detected
+ * pxroot directory), "/c/..." and "/cygdrive/c/..." map to real drives,
+ * native "C:\..." paths and relative paths pass through untouched.
+ */
 static int unlink(const char *path)
 {
-    if (_unlink(path) == 0) return 0;
-    _chmod(path, _S_IWRITE); /* retry after clearing the read-only attribute */
-    if (_unlink(path) == 0) return 0;
-    px_set_errno_from_win();
-    return -1;
+    return PX_PATH_RUN(path, ({
+        int _r = _unlink(p);
+        if (_r == 0) px_lnk_remove(p);      /* drop sidecar of emulated link */
+        else {
+            _chmod(p, _S_IWRITE);           /* retry after clearing read-only */
+            _r = _unlink(p);
+            if (_r == 0) px_lnk_remove(p);
+            else px_set_errno_from_win();
+        }
+        _r;
+    }));
 }
 
 static int rmdir(const char *path)
 {
-    if (_rmdir(path) == 0) return 0;
-    px_set_errno_from_win();
-    return -1;
+    return PX_PATH_RUN(path, ({
+        int _r = _rmdir(p);
+        if (_r != 0) px_set_errno_from_win();
+        _r;
+    }));
 }
 
 static int mkdir(const char *path, mode_t mode)
 {
     (void)mode;
-    if (_mkdir(path) == 0) return 0;
-    if (GetLastError() == ERROR_ALREADY_EXISTS) { errno = EEXIST; return -1; }
-    px_set_errno_from_win();
-    return -1;
+    return PX_PATH_RUN(path, ({
+        int _r = _mkdir(p);
+        if (_r != 0) {
+            if (GetLastError() == ERROR_ALREADY_EXISTS) { errno = EEXIST; _r = -1; }
+            else px_set_errno_from_win();
+        }
+        _r;
+    }));
 }
 
 static int access(const char *path, int amode)
 {
-    if (amode == X_OK) amode = F_OK;
-    if (_access(path, amode) == 0) return 0;
-    px_set_errno_from_win();
-    return -1;
+    if (!px_path_native_mode() && path && path[0] == '/' &&
+        px_dev_is_special(path))
+        return 0;                           /* devices/virtual files exist */
+    return PX_PATH_RUN(path, ({
+        int _m = (amode == X_OK) ? F_OK : amode;
+        int _r = _access(p, _m);
+        if (_r != 0) px_set_errno_from_win();
+        _r;
+    }));
 }
 
 static int faccessat(int dirfd, const char *path, int amode, int flag)
 {
-    char full[4096], base[4096];
+    char full[4200], base[4096];
     (void)flag;
     if (dirfd != AT_FDCWD && path && path[0] != '/' && path[1] != ':') {
         if (px_fd_getcwd(dirfd, base, sizeof(base)) == NULL) return -1;
@@ -218,11 +251,27 @@ static int faccessat(int dirfd, const char *path, int amode, int flag)
 
 static int rename(const char *oldpath, const char *newpath)
 {
-    if (MoveFileExA(oldpath, newpath,
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
-        return 0;
-    px_set_errno_from_win();
-    return -1;
+    char wnew[4200];
+    int trn;
+    return PX_PATH_RUN(oldpath, ({
+        const char *_np = newpath;
+        trn = px_path_translate(newpath, wnew, sizeof(wnew));
+        if (trn > 0) _np = wnew;
+        /* follow an emulated symlink at the destination like POSIX does */
+        {
+            char *_t = px_lnk_read(_np);
+            if (_t) {
+                strncpy(wnew, _t, sizeof(wnew) - 1);
+                wnew[sizeof(wnew) - 1] = '\0';
+                _np = wnew;
+                free(_t);
+            }
+        }
+        if (MoveFileExA(p, _np, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+            px_lnk_move(p, _np);            /* keep sidecars in sync */
+            0;
+        } else { px_set_errno_from_win(); -1; }
+    }));
 }
 
 static int chown(const char *path, uid_t owner, gid_t group)
@@ -241,38 +290,56 @@ static int fchown(int fd, uid_t owner, gid_t group)
 
 static int chmod(const char *path, mode_t mode)
 {
-    int r = _chmod(path, (mode & 0200) ? _S_IWRITE : _S_IREAD);
-    if (r != 0) px_set_errno_from_win();
-    return r;
+    return PX_PATH_RUN(path, ({
+        int _r = _chmod(p, (mode & 0200) ? _S_IWRITE : _S_IREAD);
+        if (_r != 0) px_set_errno_from_win();
+        _r;
+    }));
 }
 static int fchmod(int fd, mode_t mode)
 { (void)fd; (void)mode; errno = ENOTSUP; return -1; }
 
 static int link(const char *oldpath, const char *newpath)
 {
-    if (CreateHardLinkA(newpath, oldpath, NULL)) return 0;
-    px_set_errno_from_win();
-    return -1;
+    char wnew[4200];
+    int trn;
+    return PX_PATH_RUN(oldpath, ({
+        const char *_np = newpath;
+        trn = px_path_translate(newpath, wnew, sizeof(wnew));
+        if (trn > 0) _np = wnew;
+        if (CreateHardLinkA(_np, p, NULL)) 0;
+        else { px_set_errno_from_win(); -1; }
+    }));
 }
 
 static int symlink(const char *oldpath, const char *newpath)
 {
-    DWORD flags = (GetFileAttributesA(oldpath) & FILE_ATTRIBUTE_DIRECTORY)
-                ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-    if (CreateSymbolicLinkA(newpath, oldpath,
-                            flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE))
-        return 0;
-    px_set_errno_from_win();
-    return -1;
+    char wnew[4200];
+    int trn;
+    const char *wlink = newpath;
+    trn = px_path_translate(newpath, wnew, sizeof(wnew));
+    if (trn < 0) { errno = ENAMETOOLONG; return -1; }
+    if (trn > 0) wlink = wnew;
+    {
+        DWORD flags = (GetFileAttributesA(oldpath) & FILE_ATTRIBUTE_DIRECTORY)
+                    ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+        if (CreateSymbolicLinkA(wlink, oldpath,
+                                flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE))
+            return 0;
+        /* unprivileged Windows without developer mode: fall back to the
+           ".pxlnk" sidecar emulation understood by readlink()/stat().
+           The target stays in unix form so readers see POSIX strings. */
+        return px_symlink_emulate(oldpath, wlink);
+    }
 }
 static int symlinkat(const char *oldpath, int dirfd, const char *newpath)
 {
-    char p[4096], base[4096];
+    char q[4200], base[4096];
     (void)dirfd;
     if (dirfd != AT_FDCWD && newpath && newpath[0] != '/' && newpath[1] != ':') {
         if (px_fd_getcwd(dirfd, base, sizeof(base)) == NULL) return -1;
-        snprintf(p, sizeof(p), "%s\\%s", base, newpath);
-        newpath = p;
+        snprintf(q, sizeof(q), "%s\\%s", base, newpath);
+        newpath = q;
     }
     return symlink(oldpath, newpath);
 }
@@ -296,12 +363,28 @@ static int renameat(int oldfd, const char *oldp, int newfd, const char *newp)
 
 static ssize_t readlink(const char *path, char *buf, size_t bufsiz)
 {
-    char target[4096];
-    DWORD n = px_reparse_target(path, target, sizeof(target));
-    if (n == 0) { px_set_errno_from_win(); return -1; }
-    if ((size_t)n > bufsiz) n = (DWORD)bufsiz;
-    memcpy(buf, target, n);
-    return (ssize_t)n;
+    char win[4200];
+    int tr;
+    tr = px_path_translate(path, win, sizeof(win));
+    if (tr < 0) { errno = ENAMETOOLONG; return -1; }
+    if (tr > 0) path = win;
+    {
+        char target[4096];
+        DWORD n;
+        char *emul = px_lnk_read(path);
+        if (emul) {                        /* emulated (.pxlnk) link first */
+            size_t l = strlen(emul);
+            if (l > bufsiz) l = bufsiz;
+            memcpy(buf, emul, l);
+            free(emul);
+            return (ssize_t)l;
+        }
+        n = px_reparse_target(path, target, sizeof(target));
+        if (n == 0) { px_set_errno_from_win(); return -1; }
+        if ((size_t)n > bufsiz) n = (DWORD)bufsiz;
+        memcpy(buf, target, n);
+        return (ssize_t)n;
+    }
 }
 static ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
 {
@@ -351,15 +434,27 @@ static int isatty(int fd) { return _isatty(fd); }
 
 static char *getcwd(char *buf, size_t size)
 {
-    if (_getcwd(buf, (int)size)) return buf;
-    px_set_errno_from_win();
+    char raw[4200];
+    if (!_getcwd(raw, (int)sizeof(raw))) { px_set_errno_from_win(); return NULL; }
+    /* report the process cwd in unix form ("/c/dir" or "/rest-under-root") */
+    if (!px_path_native_mode()) {
+        char ux[4200];
+        px_path_untranslate(raw, -1, ux, sizeof(ux));
+        if (strlen(ux) + 1 <= size) { memcpy(buf, ux, strlen(ux) + 1); return buf; }
+        errno = ERANGE;
+        return NULL;
+    }
+    if (strlen(raw) + 1 <= size) { memcpy(buf, raw, strlen(raw) + 1); return buf; }
+    errno = ERANGE;
     return NULL;
 }
 static int chdir(const char *path)
 {
-    if (_chdir(path) == 0) return 0;
-    px_set_errno_from_win();
-    return -1;
+    return PX_PATH_RUN(path, ({
+        int _r = _chdir(p);
+        if (_r != 0) px_set_errno_from_win();
+        _r;
+    }));
 }
 static int fchdir(int fd)
 {
